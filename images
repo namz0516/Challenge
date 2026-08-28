@@ -1,0 +1,651 @@
+import re
+import io
+import os
+import subprocess
+import requests
+from PIL import Image, ImageOps, ImageEnhance
+from PIL.ExifTags import TAGS
+
+try:
+    import pytesseract
+    HAVE_OCR = True
+except ImportError:
+    HAVE_OCR = False
+    print("[!] pytesseract not available")
+
+
+try:
+    from pyzbar.pyzbar import decode as zbar_decode
+    HAVE_ZBAR = True
+except ImportError:
+    HAVE_ZBAR = False
+    print("[!] pyzbar not available")
+
+
+try:
+    from stegano import lsb
+    HAVE_STEGANO = True
+except ImportError:
+    HAVE_STEGANO = False
+    print("[!] stegano not available")
+
+
+BASE = "http://54.214.7.161"
+AUTH = ("namratha.reddy","cb1400c9d04ce85376dd")
+
+FILES = [
+    "/static/img/field-visit.jpg",
+    "/static/img/pattern.png",
+    "/static/img/diagram-2.png",
+    "/static/img/chart-overview.png",
+    "/static/img/diagram-1.png",
+    "/static/img/whiteboard-scan.png",
+    "/static/img/team-offsite.jpg",
+    "/static/img/office-plants.jpg",
+]
+
+
+FLAG = re.compile(
+    r"VISUALPING\{[0-9a-fA-F]{16}\}",
+    re.IGNORECASE
+)
+
+FLAG_BYTES = re.compile(
+    rb"VISUALPING\{[0-9a-fA-F]{16}\}",
+    re.IGNORECASE
+)
+
+
+
+#fuzzy ocr detection to detect regex similar values
+
+
+FUZZY_FLAG = re.compile(
+    r"""
+    V\s*[I1l]\s*S\s*[Uu]\s*A\s*[L]\s*
+    P\s*[I1l]\s*N\s*[Gg]
+    \s*
+    \{
+    [^{}\n]{10,24}
+    \}
+    """,
+    re.IGNORECASE | re.VERBOSE
+)
+
+
+#ocr where opening brace is wrong or missing
+FUZZY_BODY = re.compile(
+    r"""
+    V\s*[I1l]\s*S\s*[Uu]\s*A\s*[L]\s*
+    P\s*[I1l]\s*N\s*[Gg]
+    .{0,5}
+    [0-9A-Za-zOoIl]{12,22}
+    """,
+    re.IGNORECASE | re.VERBOSE
+)
+
+
+session = requests.Session()
+session.auth = AUTH
+found = {}
+
+#image directory to inspect later
+IMAGE_DIR = os.path.expanduser("~/visualping_suspicious_images")
+os.makedirs(IMAGE_DIR, exist_ok=True)
+
+
+def report(password, source, method):
+
+    if password not in found:
+
+        found[password] = (
+            source,
+            method
+        )
+
+        print()
+        print("=" * 70)
+        print("PASSWORD FOUND")
+        print("=" * 70)
+        print("Password:", password)
+        print("Source:  ", source)
+        print("Method:  ", method)
+        print("=" * 70)
+
+
+
+#opens image automatically
+def save_and_open_image(raw_bytes, source):
+
+    filename = source.split("/")[-1]
+
+    local_path = os.path.join(
+        IMAGE_DIR,
+        filename
+    )
+
+    try:
+
+        with open(local_path, "wb") as f:
+            f.write(raw_bytes)
+
+        print()
+        print("!!! SUSPICIOUS IMAGE !!!")
+        print("Saved:", local_path)
+        print("Opening image automatically...")
+
+        # macOS
+        subprocess.Popen(
+            ["open", local_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+    except Exception as e:
+
+        print(
+            "[!] Could not save/open image:",
+            e
+        )
+
+
+
+#txt scanner
+def scan_text(text, source, method):
+
+    if not text:
+        return
+
+    #exact flag
+
+    for m in FLAG.findall(text):
+
+        report(
+            m,
+            source,
+            method
+        )
+
+
+    #flags fuzzy
+    matches = []
+
+    for m in FUZZY_FLAG.finditer(text):
+
+        matches.append(
+            m.group()
+        )
+
+    for m in FUZZY_BODY.finditer(text):
+
+        matches.append(
+            m.group()
+        )
+
+    for candidate in matches:
+
+        print()
+        print("-" * 70)
+        print("FUZZY OCR FLAG CANDIDATE")
+        print("-" * 70)
+        print("Source :", source)
+        print("Method :", method)
+        print("OCR    :", repr(candidate))
+        print()
+        print(
+            "This resembles VISUALPING{...}."
+        )
+        print(
+            "Opening the original image for visual verification."
+        )
+        print("-" * 70)
+
+        key = source
+
+        if not hasattr(scan_text, "_opened"):
+            scan_text._opened = set()
+
+        if key not in scan_text._opened:
+
+            scan_text._opened.add(key)
+
+            try:
+
+                rr = session.get(
+                    source,
+                    timeout=15
+                )
+
+                if rr.status_code == 200:
+
+                    save_and_open_image(
+                        rr.content,
+                        source
+                    )
+
+            except Exception as e:
+
+                print(
+                    "[!] Re-fetch failed:",
+                    e
+                )
+
+
+#ocr
+
+def run_ocr(img, source):
+    if not HAVE_OCR:
+        return
+
+    variants = {
+        "raw": img,
+        "grayscale": ImageOps.grayscale(img),
+        "grayscale+autocontrast": ImageOps.autocontrast(
+            ImageOps.grayscale(img)
+        ),
+        "inverted": ImageOps.invert(img.convert("RGB")),
+        "high-contrast": ImageEnhance.Contrast(
+            ImageOps.grayscale(img)
+        ).enhance(2.5),
+        "upscaled-2x": img.resize(
+            (img.width * 2, img.height * 2),
+            Image.LANCZOS
+        ),
+    }
+
+    suspicious = False
+    ocr_outputs = []
+
+    approx_flag = re.compile(
+        r"VISUALPING\s*[\{\[\(]?[0-9a-zA-Z]{10,25}"
+    )
+
+    for variant_name, variant_img in variants.items():
+
+        try:
+            text = pytesseract.image_to_string(variant_img)
+
+            if not text:
+                continue
+
+            ocr_outputs.append((variant_name, text.strip()))
+
+            # Normalize common OCR mistakes for detection only.
+            normalized = text.upper()
+            normalized = normalized.replace(" ", "")
+            normalized = normalized.replace("\n", "")
+
+            if (
+                "VISUALPING" in normalized
+                or approx_flag.search(text.upper())
+            ):
+                suspicious = True
+
+                print(
+                    f"    [OCR RAW - {variant_name}] "
+                    f"{text.strip()}"
+                )
+
+                scan_text(
+                    text,
+                    source,
+                    f"OCR ({variant_name})"
+                )
+
+        except Exception as e:
+            print(f"    OCR failed ({variant_name}): {e}")
+
+    #open if suspicious
+    if suspicious:
+
+        print()
+        print("!" * 80)
+        print("OCR-SUSPICIOUS IMAGE")
+        print("IMAGE:", source)
+        print("Opening image for visual verification...")
+        print("!" * 80)
+
+        #save image temporarily to inspect later
+        try:
+            import tempfile
+            import os
+
+            suffix = ".png"
+            if img.format:
+                suffix = "." + img.format.lower()
+
+            fd, temp_path = tempfile.mkstemp(suffix=suffix)
+            os.close(fd)
+
+            img.save(temp_path)
+
+            subprocess.Popen(["open", temp_path])
+
+            print("OPENED:", temp_path)
+
+        except Exception as e:
+            print("Could not automatically open image:", e)
+
+        print()
+        print("OCR OUTPUTS FOR MANUAL COMPARISON:")
+        print("-" * 80)
+
+        for variant_name, text in ocr_outputs:
+            print(f"[{variant_name}]")
+            print(text)
+            print()
+
+        print("-" * 80)
+
+#qr or barcodes
+
+def run_qr(img, source):
+
+    if not HAVE_ZBAR:
+        return
+
+    try:
+
+        results = zbar_decode(img)
+
+        for result in results:
+
+            data = result.data.decode(
+                "utf-8",
+                errors="ignore"
+            )
+
+            print(
+                f"[QR/BARCODE] "
+                f"type={result.type} "
+                f"data={data}"
+            )
+
+            scan_text(
+                data,
+                source,
+                f"QR/BARCODE ({result.type})"
+            )
+
+    except Exception as e:
+
+        print(
+            "QR decode failed:",
+            e
+        )
+
+
+#lsb
+def run_lsb(raw_bytes, img_format, source):
+
+    if (
+        not HAVE_STEGANO
+        or
+        img_format not in ("PNG", "BMP")
+    ):
+        return
+
+    try:
+
+        hidden = lsb.reveal(
+            io.BytesIO(raw_bytes)
+        )
+
+        if hidden:
+
+            print(
+                "[LSB STEGANOGRAPHY]",
+                hidden[:500]
+            )
+
+            scan_text(
+                hidden,
+                source,
+                "LSB STEGANOGRAPHY"
+            )
+
+    except Exception:
+        pass
+
+
+#metadata
+
+def run_metadata_scan(img, source):
+
+    for k, v in img.info.items():
+
+        if isinstance(v, bytes):
+
+            for encoding in (
+                "utf-16-le",
+                "utf-16-be",
+                "utf-8",
+                "latin-1"
+            ):
+
+                try:
+
+                    decoded = v.decode(
+                        encoding,
+                        errors="ignore"
+                    )
+
+                    scan_text(
+                        decoded,
+                        source,
+                        f"METADATA ({k}, {encoding})"
+                    )
+
+                except Exception:
+                    pass
+
+        else:
+
+            scan_text(
+                str(v),
+                source,
+                f"METADATA ({k})"
+            )
+
+
+    #exif
+
+    try:
+
+        exif = img.getexif()
+
+        for k, v in (exif or {}).items():
+
+            tag = TAGS.get(
+                k,
+                k
+            )
+
+            scan_text(
+                str(v),
+                source,
+                f"EXIF ({tag})"
+            )
+
+    except Exception:
+        pass
+
+
+#raw byte search
+
+def run_keyword_search(raw_bytes, source):
+
+    strings = re.findall(
+        rb"[\x20-\x7e]{4,}",
+        raw_bytes
+    )
+
+    for s in strings:
+
+        text = s.decode(
+            "ascii",
+            errors="ignore"
+        )
+
+        if any(
+            kw in text.lower()
+            for kw in (
+                "password",
+                "secret",
+                "flag",
+                "token",
+                "visualping"
+            )
+        ):
+
+            print(
+                "[INTERESTING STRING]",
+                text
+            )
+
+    for m in FLAG_BYTES.finditer(
+        raw_bytes
+    ):
+
+        report(
+            m.group().decode(
+                "ascii",
+                errors="ignore"
+            ),
+            source,
+            "RAW BYTES"
+        )
+
+
+for path in FILES:
+
+    url = BASE + path
+
+    print()
+    print("=" * 80)
+    print("FETCHING:", url)
+    print("=" * 80)
+
+    try:
+
+        r = session.get(
+            url,
+            timeout=15
+        )
+
+    except Exception as e:
+
+        print(
+            "ERROR:",
+            e
+        )
+
+        continue
+
+
+    print(
+        "STATUS:",
+        r.status_code,
+        "TYPE:",
+        r.headers.get("Content-Type"),
+        "LEN:",
+        len(r.content)
+    )
+
+
+    if r.status_code != 200:
+        continue
+
+
+    raw_bytes = r.content
+
+    run_keyword_search(
+        raw_bytes,
+        url
+    )
+
+    try:
+
+        img = Image.open(
+            io.BytesIO(raw_bytes)
+        )
+
+    except Exception as e:
+
+        print(
+            "Not a PIL-readable image:",
+            e
+        )
+
+        continue
+
+
+    print(
+        f"format={img.format} "
+        f"size={img.size} "
+        f"mode={img.mode}"
+    )
+
+    run_metadata_scan(
+        img,
+        url
+    )
+
+    run_ocr(
+        img,
+        url
+    )
+
+    run_qr(
+        img,
+        url
+    )
+
+    run_lsb(
+        raw_bytes,
+        img.format,
+        url
+    )
+
+print()
+print("=" * 80)
+print("DONE")
+print("=" * 80)
+
+print(
+    "Passwords found:",
+    len(found)
+)
+
+for pwd, (source, method) in found.items():
+
+    print(
+        f"{pwd} <- {method} <- {source}"
+    )
+
+print("=" * 80)
+
+
+missing = []
+
+if not HAVE_OCR:
+    missing.append(
+        "pytesseract + tesseract"
+    )
+
+if not HAVE_ZBAR:
+    missing.append(
+        "pyzbar + zbar"
+    )
+
+if not HAVE_STEGANO:
+    missing.append(
+        "stegano"
+    )
+
+if missing:
+
+    print(
+        "Missing:",
+        ", ".join(missing)
+    )
